@@ -7,11 +7,29 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 
-from .models import DNN, MNIST_CNN, CIFAR10_CNN
-from .dataset import get_datasets, split_dataset
-from .utils import set_seed, choose_clients, select_optimizer, load_config, acc_average
+from .models import EENet20
+from .dataset import get_datasets, split_dataset, split_client_tests
+from .utils import (
+    set_seed, choose_clients, select_optimizer, 
+    load_config, acc_average, evaluate_clients,
+)
 from .trainer import train, test
 from .server import federated_learning
+
+
+def full_state(model):
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+    }
+
+
+def shared_state(model, prefixes):
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+        if key.startswith(prefixes)
+    }
 
 
 if __name__ == "__main__":
@@ -34,40 +52,74 @@ if __name__ == "__main__":
     dirichlet     = config['FL']['dirichlet']
     ite_num       = config['FL']['ite_num']
     cohort        = config['FL']['cohort']
+    mode          = config['FL']['mode']
+
+    shared_prefixes = ("conv1.","bn1.","layer1.","layer2.0.")
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     train_dataset, test_loader = get_datasets(batch_size, dataset_name)
-    subsets = split_dataset(train_dataset, num_clients, dirichlet)
-
-    # 各クライアントのデータローダーを作成
-    client_loaders = [DataLoader(subset, batch_size=batch_size, shuffle=True)
-                       for subset in subsets]
-
-    if dataset_name == "MNIST":
-        global_model = MNIST_CNN().to(device)
-
-    elif dataset_name == "CIFAR_10":
-        global_model = CIFAR10_CNN().to(device)
-        
-    global_model.train()
-
-    acc_history = [[] for _ in range(global_rounds)]
 
     for ite in range(ite_num):
+        seed = 100 + ite
+        set_seed(seed)
+
+        global_model = EENet20(channels=(16, 16, 32)).to(device)
+        initial_state = full_state(global_model)
+
+        subsets = split_dataset(train_dataset, num_clients, dirichlet)
+
+        test_subsets, train_counts, test_counts = (
+            split_client_tests(subsets, test_loader.dataset, seed=seed, num_classes=10, mode=mode)
+            )
+        
+        client_loaders = [
+                    DataLoader(
+                        subset, batch_size=batch_size, shuffle=True, drop_last=True,
+                        generator=torch.Generator().manual_seed(seed + i),
+                    )
+                    for i, subset in enumerate(subsets)
+                ]
+        
+        test_loaders = [
+            DataLoader(
+                subset,
+                batch_size=batch_size,
+                shuffle=False,
+                drop_last=False,
+                generator=torch.Generator().manual_seed(seed + i)
+            ) for i, subset in enumerate(test_subsets)
+        ]
+        
+        global_model.train()
+
+        acc_history = [[] for _ in range(global_rounds)]
+        pFL_acc_history = []
+        initial_state = full_state(global_model)
 
         print(f"iteration {ite+1}/ {ite_num}")
 
-        set_seed(ite)
+        set_seed(seed)
+        selected_clients = [choose_clients(num_clients, cohort) for _ in range(global_rounds)]
+        global_model.load_state_dict(initial_state)
+        client_states = [full_state(global_model) for _ in range(num_clients)]
 
-        for round in range(global_rounds):
+        for global_round in range(global_rounds):
+            set_seed(seed + global_round)
 
-            print(f"Round {round+1}/ {global_rounds}")
+            print(f"Round {global_round+1}/ {global_rounds}")
 
-            client_updates = []
+            local_models = []            
 
-            for client_idx in choose_clients(num_clients, cohort):
+            for client_idx in selected_clients[global_round]:
+                client_loaders[client_idx].generator.manual_seed(seed + global_round + client_idx)
+
                 local_model = copy.deepcopy(global_model)
+                local_model.load_state_dict(client_states[client_idx])
+                # 共有部分のパラメータをグローバルモデルからロード
+                local_model.load_state_dict(
+                    shared_state(global_model, shared_prefixes), strict=False
+                )
                 local_optimizer = select_optimizer(
                     optimizer,
                     local_model,
@@ -78,14 +130,39 @@ if __name__ == "__main__":
                 for _ in range(epochs):
                     train(local_optimizer, local_model, client_loaders[client_idx], device, model_name)
 
-                client_updates.append(local_model.state_dict())
+                client_states[client_idx] = full_state(local_model)
+                local_models.append(shared_state(local_model, shared_prefixes))
 
             # クライアントのモデルを平均化してグローバルモデルを更新
-            federated_learning(client_updates, global_model)
+            federated_learning(local_models, global_model)
 
-            # グローバルモデルを評価
-            test_acc = test(global_model, test_loader, device)
-            acc_history[round].append(test_acc)
+            test_acc = evaluate_clients(global_model, client_states, test_loaders, device, [10]*num_clients, shared_prefixes)
+            acc_history[global_round].append(np.mean(test_acc))
+            
+            print(f"accuracy: {acc_history[global_round][-1]:.4f}")
+        
+        # 全ラウンド終了後、共有層を固定して各端末の個人層を1エポックだけ学習
+        for client_idx in range(num_clients):
+            local_model = copy.deepcopy(global_model)
+            local_model.load_state_dict(client_states[client_idx])
+            local_model.load_state_dict(
+                shared_state(global_model, shared_prefixes), strict=False
+            )
+
+            for name, parameter in local_model.named_parameters():
+                parameter.requires_grad_(not name.startswith(shared_prefixes))
+
+            local_optimizer = select_optimizer(optimizer, local_model, lr)
+
+            train(
+                local_optimizer, local_model, client_loaders[client_idx],
+                device, model_name, frozen_layers=shared_prefixes,
+            )
+            client_states[client_idx] = full_state(local_model)
+        
+        pFL_acc_history.append(evaluate_clients(
+            global_model, client_states, test_loaders, device, [10]*num_clients, shared_prefixes,
+        ))
     
     final_acc = acc_average(acc_history)
 
@@ -93,16 +170,16 @@ if __name__ == "__main__":
     save_dir = os.path.join(
         parent_dir,
         "results",
-        f"{dataset_name}"
-        f"{model_name}"
-        f"{dirichlet},{num_clients},{dirichlet}"
+        f"{dataset_name}_"
+        f"{model_name}_"
+        f"{dirichlet}_,{cohort}/{num_clients}"
         )
 
     os.makedirs(save_dir, exist_ok=True)
 
     # csv出力
     df = pd.DataFrame({
-        "round": global_rounds,
+        "round": np.arange(1, global_rounds + 1),
         "accuracy": final_acc
     })
     csv_path = os.path.join(save_dir, "FedAvg.csv")

@@ -1,10 +1,5 @@
-__pycache__
-.cache/
-.gnupg/
-.dotnet/
-.ssh/
-.vscode-server
-data/
-src/__pycache__
-.gitconfig
-.env
+/data
+/results
+/src/__pycache__
+docer-compose.yml
+Dockerfile

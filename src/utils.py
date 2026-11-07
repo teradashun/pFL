@@ -1,9 +1,12 @@
 import os
 import yaml
+import copy
 import random
 import numpy as np
 import torch
 import torch.optim as optim
+
+from .trainer import test
 
 
 def load_config(dir):   #引数のパスはFedAvg
@@ -26,10 +29,10 @@ def set_seed(seed):
 
 def select_optimizer(optim_name, local_model, lr):
     if optim_name == "SGD":
-        return optim.SGD(local_model.parameters(), lr=lr)
+        return optim.SGD(filter(lambda p: p.requires_grad, local_model.parameters()), lr=lr)
     
     elif optim_name == "Adam":
-        return optim.Adam(local_model.parameters(), lr=lr)
+        return optim.Adam(filter(lambda p: p.requires_grad, local_model.parameters()), lr=lr)
     
     else:
         raise NameError(f"オプティマイザの名前 '{optim_name}' はサポートされていません")
@@ -43,4 +46,33 @@ def acc_average(acc_history: list[list]) -> list:
     acc_history = np.array(acc_history)
     final_acc = np.mean(acc_history, axis=1)
     return final_acc
-    
+
+
+def evaluate_clients(global_model, client_states, test_loaders, device, evaluation_exits, prefixes):
+        current_shared = {
+            key: value for key, value in global_model.state_dict().items()
+            if key.startswith(prefixes)
+        }
+        evaluation_model = copy.deepcopy(global_model)
+        accuracies = []
+
+        for i in range(len(client_states)):
+            evaluation_model.load_state_dict(
+                client_states[i],
+                strict=True,
+            )
+            evaluation_model.load_state_dict(
+                current_shared,
+                strict=False,
+            )
+
+            accuracies.append(
+                test(
+                    evaluation_model,
+                    test_loaders[i],
+                    device,
+                    evaluation_exits[i],
+                )
+            )
+
+        return accuracies

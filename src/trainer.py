@@ -2,34 +2,32 @@ import torch
 import torch.nn as nn
 
 
-def train(optimizer, model, train_loader, device, model_name):
+def train(optimizer, model, train_loader, device, model_name, frozen_layers=()):
     # 評価関数の定義
     criterion = nn.CrossEntropyLoss()
 
     # model 学習モードに設定
     model.train()
+    for name, module in model.named_modules():
+        if (name + ".").startswith(frozen_layers):
+            module.eval()
 
     for i, (images, labels) in enumerate(train_loader):
-        if model_name == "DNN":
-            # viewで1次元配列に変更
-            images, labels = images.view(-1, 28*28).to(device), labels.to(device)
+        images, labels = images.to(device), labels.to(device)
         
-        elif model_name == "MNIST_CNN" or "CIFAR10_CNN":
-            images, labels = images.to(device), labels.to(device)
-        
-        # 勾配をリセット
         optimizer.zero_grad()
-        # 推論
         outputs = model(images)
-        # lossを計算
-        loss = criterion(outputs, labels)
-        # 誤差逆伝播
+
+        if isinstance(outputs, tuple):
+            loss = sum(criterion(logits, labels) for logits in outputs)
+        else:
+            loss = criterion(outputs, labels)
+            
         loss.backward()
-        # パラメータ更新
         optimizer.step()
 
 
-def test(model, test_loader, device):
+def test(model, test_loader, device, exit_id=None):
 
     # model 評価モードに設定
     model.eval()
@@ -40,7 +38,7 @@ def test(model, test_loader, device):
 
         for inputs, labels in test_loader:
             inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
+            outputs = model(inputs) if exit_id is None else model.forward_exit(inputs, exit_id)
 
             correct_preds += outputs.max(1)[1].eq(labels).sum().item()
             total_preds += outputs.size(0)

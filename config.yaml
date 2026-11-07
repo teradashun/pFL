@@ -1,14 +1,15 @@
 training:
   batch_size: 64
-  epochs: 5
-  lr: 0.001   # {SGD: 0.1, Adam: 0.001}
-  optimizer: Adam   # SGD or Adam
-  model_name: CIFAR10_CNN   # [DNN, MNIST_CNN, CIFAR10_CNN]
-  dataset_name: CIFAR_10   # [MNIST, CIFAR_10]
+  epochs: 3
+  lr: 0.1   # {SGD: 0.1, Adam: 0.001}
+  optimizer: SGD   # SGD or Adam
+  model_name: EENet20
+  dataset_name: CIFAR_10
 
 FL:
-  global_rounds: 10
+  global_rounds: 50
   num_clients: 10
-  dirichlet: 0.1   # [0.1, 1e20]
+  dirichlet: 100000000000
   ite_num: 1
-  cohort: 5
+  cohort: 10
+  mode: "random"
